@@ -4,12 +4,22 @@ A modular collection of Python scripts for automating common Zendesk administrat
 
 ## Scripts
 
+### Admin & Management
+
 | Script | Purpose |
 |--------|---------|
 | [Zombie Trigger Auditor](#1-zombie-trigger-auditor) | Find triggers/automations with zero usage |
 | [Bulk Macro Search & Replace](#2-bulk-macro-content-search--replace) | Search and replace text across all macros |
 | [User Permission Snapshotter](#3-user-permission-snapshotter) | Export admin/agent users to CSV for audits |
 | [Tag Cleanup Bot](#4-tag-cleanup-bot) | Identify orphan tags for consolidation |
+
+### Security & Compliance
+
+| Script | Purpose |
+|--------|---------|
+| [Suspended Ticket Spam-Killer](#5-suspended-ticket-spam-killer) | Bulk-delete suspended tickets by cause pattern |
+| [Attachment Retention Enforcer](#6-attachment-retention-enforcer) | Redact attachments from old tickets for privacy/storage |
+| [Inactive API Token Auditor](#7-inactive-api-token-auditor) | Find OAuth tokens unused in 30+ days for revocation |
 
 ---
 
@@ -19,12 +29,17 @@ All scripts share a common library (`zendesk_admin/`) that handles authenticatio
 
 ```mermaid
 graph TD
-    subgraph "scripts/"
+    subgraph "scripts/ — Admin & Management"
         A[zombie_trigger_auditor.py]
         B[bulk_macro_search_replace.py]
         C[user_permission_snapshotter.py]
         D[tag_cleanup_bot.py]
-        E[your_new_script.py]
+    end
+
+    subgraph "scripts/ — Security & Compliance"
+        S1[suspended_ticket_spam_killer.py]
+        S2[attachment_retention_enforcer.py]
+        S3[inactive_api_token_auditor.py]
     end
 
     subgraph "zendesk_admin/"
@@ -34,7 +49,8 @@ graph TD
         I["utils.py<br/>(CSV & JSON output)"]
     end
 
-    A & B & C & D & E --> F & G & H & I
+    A & B & C & D --> F & G & H & I
+    S1 & S2 & S3 --> F & G & H & I
 
     G -->|"HTTP requests<br/>with auth"| J[Zendesk REST API v2]
     G -->|"handles"| K["Rate Limiting<br/>(429 + Retry-After)"]
@@ -349,6 +365,259 @@ temp_migration_batch2                              201
 
 ---
 
+## Security & Compliance Scripts
+
+### 5. Suspended Ticket Spam-Killer
+
+Bulk-deletes suspended tickets based on specific **cause patterns** (e.g., "Detected as spam", "Automated response mail") to keep the suspended queue manageable. Operates in **report-only mode** by default — requires `--delete` flag to actually remove tickets.
+
+```mermaid
+flowchart TD
+    A[Start] --> B[Load Configuration]
+    B --> C[Fetch all<br/>Suspended Tickets]
+    C --> D{Filter by<br/>cause pattern?}
+    D -->|Yes| E[Match cause<br/>substring, case-insensitive]
+    D -->|No| F[Include all]
+    E --> G{Filter by<br/>age?}
+    F --> G
+    G -->|--older-than N| H[Exclude tickets<br/>newer than N days]
+    G -->|No age filter| I[Include all ages]
+    H --> J[Group by cause<br/>for summary]
+    I --> J
+    J --> K{--delete flag?}
+    K -->|No| L[Report-only mode<br/>show matches]
+    K -->|Yes| M{--dry-run?}
+    M -->|Yes| L
+    M -->|No| N[Bulk delete in<br/>batches of 100]
+    N --> O[Report deleted count]
+```
+
+#### Usage
+
+```bash
+# List all suspended tickets (report only)
+python -m scripts.suspended_ticket_spam_killer
+
+# List suspended tickets matching specific causes
+python -m scripts.suspended_ticket_spam_killer --causes "Detected as spam"
+
+# Multiple cause patterns + age filter
+python -m scripts.suspended_ticket_spam_killer \
+  --causes "Detected as spam" "Automated response mail" \
+  --older-than 30
+
+# Preview deletions (dry run)
+python -m scripts.suspended_ticket_spam_killer \
+  --causes "Detected as spam" --delete --dry-run
+
+# Actually delete matched tickets
+python -m scripts.suspended_ticket_spam_killer \
+  --causes "Detected as spam" --older-than 60 --delete
+
+# Save report to file
+python -m scripts.suspended_ticket_spam_killer --causes "Detected as spam" -o spam_report.json
+```
+
+#### Options
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--causes`, `-c` | *(all)* | Cause patterns to match (case-insensitive substring) |
+| `--older-than` | *(none)* | Only target tickets older than N days |
+| `--delete` | off | Actually delete matched tickets |
+| `--dry-run` | off | Preview deletions (same as omitting `--delete`) |
+| `--output`, `-o` | stdout | Save match report to JSON file |
+| `--verbose`, `-v` | off | Enable debug logging |
+| `--env-file` | `.env` | Path to credentials file |
+
+#### Sample Output
+
+```
+Scanning suspended tickets (causes matching: 'Detected as spam', older than 30 days)...
+
+Found 47 matching suspended ticket(s):
+  - Detected as spam: 42
+  - Detected as spam by Zendesk: 5
+
+ID                   Created                Cause                          Subject
+----------------------------------------------------------------------------------------------------
+8234567890123        2026-01-15             Detected as spam               Win a free iPhone!!!
+8234567890456        2026-01-20             Detected as spam               Urgent business proposal
+  ... and 45 more
+
+[REPORT-ONLY MODE] No tickets deleted.
+Use --delete to permanently remove these tickets.
+```
+
+---
+
+### 6. Attachment Retention Enforcer
+
+Identifies tickets older than a configurable number of years and **redacts attachments** while preserving conversation text. Zendesk replaces redacted attachments with an empty `redacted.txt` file. Helps manage storage costs and comply with data retention/privacy policies (e.g., GDPR).
+
+**WARNING: Redaction is PERMANENT and cannot be undone.**
+
+```mermaid
+flowchart TD
+    A[Start] --> B[Load Configuration]
+    B --> C["Search tickets created<br/>before cutoff date<br/>(Search API)"]
+    C --> D[Limit to --max-tickets<br/>for safety]
+    D --> E[For each ticket:<br/>fetch comments +<br/>attachments]
+    E --> F{Attachments<br/>found?}
+    F -->|No| G[Skip ticket]
+    F -->|Yes| H[Record attachment<br/>details + size]
+    G --> I[Summary report:<br/>tickets, attachments, size]
+    H --> I
+    I --> J{--redact flag?}
+    J -->|No| K[Report-only mode]
+    J -->|Yes| L{--dry-run?}
+    L -->|Yes| K
+    L -->|No| M["PUT .../redact<br/>for each attachment"]
+    M --> N["Attachment replaced<br/>with redacted.txt"]
+    N --> O[Report redacted count<br/>+ storage freed]
+```
+
+#### Usage
+
+```bash
+# Report attachments on tickets older than 2 years (report only)
+python -m scripts.attachment_retention_enforcer --older-than-years 2
+
+# Filter to closed tickets only
+python -m scripts.attachment_retention_enforcer --older-than-years 2 --status closed
+
+# Preview redaction (dry run)
+python -m scripts.attachment_retention_enforcer --older-than-years 3 --redact --dry-run
+
+# Actually redact attachments (PERMANENT)
+python -m scripts.attachment_retention_enforcer --older-than-years 3 --status closed --redact
+
+# Process more tickets (default limit: 100)
+python -m scripts.attachment_retention_enforcer --older-than-years 2 --max-tickets 500
+
+# Save attachment report to file
+python -m scripts.attachment_retention_enforcer --older-than-years 2 -o attachments.json
+```
+
+#### Options
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--older-than-years` | *(required)* | Target tickets created more than N years ago |
+| `--status` | *(all)* | Filter by ticket status: new/open/pending/hold/solved/closed |
+| `--redact` | off | Actually redact attachments (permanent!) |
+| `--dry-run` | off | Preview redactions (same as omitting `--redact`) |
+| `--max-tickets` | `100` | Max tickets to process per run (safety limit) |
+| `--output`, `-o` | stdout | Save attachment report to JSON file |
+| `--verbose`, `-v` | off | Enable debug logging |
+| `--env-file` | `.env` | Path to credentials file |
+
+#### Sample Output
+
+```
+Searching for tickets created before 2024-03-31 with status 'closed'...
+Found 234 ticket(s) matching criteria.
+Limiting to first 100 tickets (use --max-tickets to adjust).
+
+Scanning 100 ticket(s) for attachments...
+  Scanned 20/100 tickets (45 attachments found)
+  Scanned 40/100 tickets (89 attachments found)
+  Scanned 100/100 tickets (156 attachments found)
+
+Results:
+  Tickets scanned:           100
+  Tickets with attachments:  67
+  Total attachments found:   156
+  Total attachment size:     487.3 MB
+
+Ticket       Attachment          Size  File Name
+---------------------------------------------------------------------------
+12345        99001            2.3 MB  invoice_scan.pdf
+12345        99002          512.0 KB  receipt.jpg
+12890        99155           15.7 MB  debug_log.zip
+  ... and 153 more (see full report with -o)
+
+[REPORT-ONLY MODE] No attachments redacted.
+Use --redact to permanently redact these attachments.
+```
+
+---
+
+### 7. Inactive API Token Auditor
+
+Lists all **OAuth access tokens** and highlights those that haven't been used within a configurable number of days, alerting the admin to revoke them for security. Cross-references token owners with user details for context.
+
+```mermaid
+flowchart TD
+    A[Start] --> B[Load Configuration]
+    B --> C[Fetch all OAuth tokens<br/>from /api/v2/oauth/tokens]
+    C --> D[Collect unique<br/>user IDs from tokens]
+    D --> E[Batch-fetch user<br/>details via show_many]
+    E --> F[Classify each token]
+    F --> G{used_at field?}
+    G -->|null| H["Status: never_used"]
+    G -->|has date| I{"used_at older than<br/>--inactive-days?"}
+    I -->|Yes| J["Status: inactive"]
+    I -->|No| K["Status: active"]
+    H & J & K --> L[Sort: never_used first<br/>then inactive by days]
+    L --> M[Summary: active /<br/>inactive / never_used]
+    M --> N[Output report<br/>JSON or CSV]
+```
+
+#### Usage
+
+```bash
+# Audit tokens with default 30-day inactivity threshold
+python -m scripts.inactive_api_token_auditor
+
+# Custom inactivity threshold (90 days)
+python -m scripts.inactive_api_token_auditor --inactive-days 90
+
+# Export as CSV
+python -m scripts.inactive_api_token_auditor --format csv -o token_audit.csv
+
+# Export as JSON
+python -m scripts.inactive_api_token_auditor -o token_audit.json
+```
+
+#### Options
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--inactive-days` | `30` | Mark tokens inactive if unused for N days |
+| `--format` | `json` | Output format: `json` or `csv` |
+| `--output`, `-o` | stdout | Save report to file |
+| `--verbose`, `-v` | off | Enable debug logging |
+| `--env-file` | `.env` | Path to credentials file |
+
+#### Sample Output
+
+```
+Fetching OAuth tokens...
+Found 12 OAuth token(s).
+Fetching details for 8 token owner(s)...
+
+Token Audit Summary (inactive threshold: 30 days):
+  Total tokens:    12
+  Active:          7
+  Inactive:        3
+  Never used:      2
+
+Tokens requiring attention (5):
+ID           Status        Last Used      Days   User                      Scopes
+-----------------------------------------------------------------------------------------------
+44012        never_used    never          N/A    dev-bot@company.com       read, write
+44018        never_used    never          N/A    test@company.com          read
+44005        inactive      2026-01-15     75     old-integration@co.com    read, write
+44009        inactive      2026-02-01     58     api-user@company.com      read
+44011        inactive      2026-02-20     39     reports@company.com       read
+
+Recommendation: Review and revoke inactive/unused tokens in
+Admin Center > Apps and Integrations > APIs > OAuth Tokens
+```
+
+---
+
 ## Adding a New Script
 
 The project is designed for easy extension. To add a new script:
@@ -403,6 +672,7 @@ The shared `ZendeskClient` handles authentication, pagination, and rate limiting
 |--------|-------------|
 | `client.get(endpoint, params)` | GET request, returns JSON dict |
 | `client.put(endpoint, json)` | PUT request, returns JSON dict |
+| `client.delete(endpoint, params)` | DELETE request, returns JSON dict or None (204) |
 | `client.paginate(endpoint, key, params)` | Yields individual records from paginated endpoint |
 
 ---
@@ -450,6 +720,25 @@ For large Zendesk instances, consider running scripts during off-peak hours.
 - Tags referenced only in **Macros** or **SLA policies** are not checked (only Triggers, Automations, and Views are scanned).
 - Tag names are compared as exact strings (case-sensitive).
 
+### Suspended Ticket Spam-Killer
+- Bulk delete is limited to **100 ticket IDs per API request** (handled automatically in batches).
+- Deletion is **permanent** — suspended tickets cannot be recovered after deletion.
+- The `cause` field is matched as a case-insensitive substring. Partial matches may capture unintended tickets — always review in report-only mode first.
+- Only Admins or custom-role agents with suspended ticket permissions can access this endpoint.
+
+### Attachment Retention Enforcer
+- Redaction is **permanent and cannot be undone**. Zendesk replaces the attachment with an empty `redacted.txt` file.
+- Cannot redact attachments on **closed tickets** on some Zendesk plans. The script logs warnings for failed redactions.
+- Uses the Zendesk Search API, which has its own rate limits and may return incomplete results for very large instances.
+- The `--max-tickets` safety limit defaults to 100 per run to prevent accidental mass redaction.
+- File size reported is from Zendesk metadata — actual storage savings may vary.
+
+### Inactive API Token Auditor
+- Audits **OAuth access tokens only**. Generic API tokens created in the Admin Center are **not queryable via the REST API** and will not appear in results.
+- The `used_at` field tracks the last time the token was used for an API request. A `null` value means the token was never used.
+- This script is **read-only** — it does not revoke tokens. Revocation must be done manually in Admin Center.
+- Token scopes and client IDs are shown for context but cannot be modified via this script.
+
 ### General
 - All scripts require Admin-level API access.
 - API token authentication only (OAuth not supported).
@@ -475,10 +764,13 @@ Zendesk-Admin-Management-Scripts/
 │   └── utils.py            # CSV and JSON output helpers
 └── scripts/                # Runnable admin scripts
     ├── __init__.py
-    ├── zombie_trigger_auditor.py
-    ├── bulk_macro_search_replace.py
-    ├── user_permission_snapshotter.py
-    └── tag_cleanup_bot.py
+    ├── zombie_trigger_auditor.py         # Admin & Management
+    ├── bulk_macro_search_replace.py      # Admin & Management
+    ├── user_permission_snapshotter.py    # Admin & Management
+    ├── tag_cleanup_bot.py                # Admin & Management
+    ├── suspended_ticket_spam_killer.py   # Security & Compliance
+    ├── attachment_retention_enforcer.py  # Security & Compliance
+    └── inactive_api_token_auditor.py     # Security & Compliance
 ```
 
 ---

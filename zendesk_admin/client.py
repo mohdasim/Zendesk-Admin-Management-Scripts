@@ -68,6 +68,14 @@ class ZendeskClient:
         url = self._build_url(endpoint)
         return self._request("PUT", url, json=json).json()
 
+    def delete(self, endpoint: str, params: dict | None = None) -> dict | None:
+        """Send a DELETE request. Returns JSON response or None for 204."""
+        url = self._build_url(endpoint)
+        response = self._request("DELETE", url, params=params)
+        if response.status_code == 204:
+            return None
+        return response.json()
+
     def paginate(
         self,
         endpoint: str,
