@@ -545,33 +545,53 @@ Use --redact to permanently redact these attachments.
 
 ### 7. Inactive API Token Auditor
 
-Lists all **OAuth access tokens** and highlights those that haven't been used within a configurable number of days, alerting the admin to revoke them for security. Cross-references token owners with user details for context.
+Lists all **OAuth access tokens** and **API tokens**, then highlights those that haven't been used within a configurable number of days, alerting the admin to revoke them for security. Cross-references token owners with user details for context.
+
+The script audits two token types:
+- **OAuth tokens** via `/api/v2/oauth/tokens` (tracks last use via `used_at` field)
+- **API tokens** via `/api/v2/api_tokens` (tracks last use via `last_used_at` field)
+
+If the API tokens endpoint is not available on your Zendesk plan (returns 403/404), the script falls back gracefully and reports only OAuth tokens.
 
 ```mermaid
 flowchart TD
     A[Start] --> B[Load Configuration]
-    B --> C[Fetch all OAuth tokens<br/>from /api/v2/oauth/tokens]
-    C --> D[Collect unique<br/>user IDs from tokens]
-    D --> E[Batch-fetch user<br/>details via show_many]
-    E --> F[Classify each token]
-    F --> G{used_at field?}
-    G -->|null| H["Status: never_used"]
-    G -->|has date| I{"used_at older than<br/>--inactive-days?"}
-    I -->|Yes| J["Status: inactive"]
-    I -->|No| K["Status: active"]
-    H & J & K --> L[Sort: never_used first<br/>then inactive by days]
-    L --> M[Summary: active /<br/>inactive / never_used]
-    M --> N[Output report<br/>JSON or CSV]
+    B --> C{--token-type?}
+    C -->|all or oauth| D[Fetch OAuth tokens<br/>/api/v2/oauth/tokens]
+    C -->|all or api| E[Fetch API tokens<br/>/api/v2/api_tokens]
+    C -->|all| D & E
+    E --> F{Endpoint<br/>available?}
+    F -->|200 OK| G[Parse API tokens]
+    F -->|403/404| H[Log warning<br/>continue without]
+    D --> I[Collect user IDs<br/>from all tokens]
+    G --> I
+    H --> I
+    I --> J[Batch-fetch user<br/>details via show_many]
+    J --> K[Classify each token]
+    K --> L{Last used field<br/>present?}
+    L -->|null| M["Status: never_used"]
+    L -->|has date| N{"Older than<br/>--inactive-days?"}
+    N -->|Yes| O["Status: inactive"]
+    N -->|No| P["Status: active"]
+    M & O & P --> Q[Sort: never_used first<br/>then inactive by days]
+    Q --> R[Summary by type:<br/>OAuth + API counts]
+    R --> S[Output report<br/>JSON or CSV]
 ```
 
 #### Usage
 
 ```bash
-# Audit tokens with default 30-day inactivity threshold
+# Audit all token types with default 30-day inactivity threshold
 python -m scripts.inactive_api_token_auditor
 
 # Custom inactivity threshold (90 days)
 python -m scripts.inactive_api_token_auditor --inactive-days 90
+
+# Audit only OAuth tokens
+python -m scripts.inactive_api_token_auditor --token-type oauth
+
+# Audit only API tokens
+python -m scripts.inactive_api_token_auditor --token-type api
 
 # Export as CSV
 python -m scripts.inactive_api_token_auditor --format csv -o token_audit.csv
@@ -585,6 +605,7 @@ python -m scripts.inactive_api_token_auditor -o token_audit.json
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--inactive-days` | `30` | Mark tokens inactive if unused for N days |
+| `--token-type` | `all` | Token type to audit: `all`, `oauth`, or `api` |
 | `--format` | `json` | Output format: `json` or `csv` |
 | `--output`, `-o` | stdout | Save report to file |
 | `--verbose`, `-v` | off | Enable debug logging |
@@ -594,26 +615,33 @@ python -m scripts.inactive_api_token_auditor -o token_audit.json
 
 ```
 Fetching OAuth tokens...
-Found 12 OAuth token(s).
-Fetching details for 8 token owner(s)...
+  Found 12 OAuth token(s).
+Fetching API tokens...
+  Found 5 API token(s).
+Fetching details for 10 token owner(s)...
 
 Token Audit Summary (inactive threshold: 30 days):
-  Total tokens:    12
-  Active:          7
-  Inactive:        3
-  Never used:      2
+  Total tokens:    17
+    OAuth tokens:  12
+    API tokens:    5
+  Active:          9
+  Inactive:        5
+  Never used:      3
 
-Tokens requiring attention (5):
-ID           Status        Last Used      Days   User                      Scopes
------------------------------------------------------------------------------------------------
-44012        never_used    never          N/A    dev-bot@company.com       read, write
-44018        never_used    never          N/A    test@company.com          read
-44005        inactive      2026-01-15     75     old-integration@co.com    read, write
-44009        inactive      2026-02-01     58     api-user@company.com      read
-44011        inactive      2026-02-20     39     reports@company.com       read
+Tokens requiring attention (8):
+Type        ID           Status        Last Used      Days   User                      Description/Scopes
+--------------------------------------------------------------------------------------------------------------
+API         78901        never_used    never          N/A    staging-bot@company.com   Staging integration
+API         78905        never_used    never          N/A    test@company.com          Test token
+OAuth       44012        never_used    never          N/A    dev-bot@company.com       read, write
+OAuth       44005        inactive      2026-01-15     75     old-integration@co.com    read, write
+API         78903        inactive      2026-02-10     49     data-sync@company.com     Data sync service
+OAuth       44009        inactive      2026-02-01     58     api-user@company.com      read
+OAuth       44011        inactive      2026-02-20     39     reports@company.com       read
+API         78904        inactive      2026-02-25     34     export@company.com        CSV export tool
 
 Recommendation: Review and revoke inactive/unused tokens in
-Admin Center > Apps and Integrations > APIs > OAuth Tokens
+Admin Center > Apps and Integrations > APIs
 ```
 
 ---
@@ -734,10 +762,11 @@ For large Zendesk instances, consider running scripts during off-peak hours.
 - File size reported is from Zendesk metadata — actual storage savings may vary.
 
 ### Inactive API Token Auditor
-- Audits **OAuth access tokens only**. Generic API tokens created in the Admin Center are **not queryable via the REST API** and will not appear in results.
-- The `used_at` field tracks the last time the token was used for an API request. A `null` value means the token was never used.
+- Audits both **OAuth tokens** (`/api/v2/oauth/tokens`) and **API tokens** (`/api/v2/api_tokens`).
+- The `/api/v2/api_tokens` endpoint **may not be available on all Zendesk plans**. If it returns 403 or 404, the script falls back gracefully and reports only OAuth tokens.
+- OAuth tokens use the `used_at` field; API tokens use the `last_used_at` field. A `null` value means the token was never used.
 - This script is **read-only** — it does not revoke tokens. Revocation must be done manually in Admin Center.
-- Token scopes and client IDs are shown for context but cannot be modified via this script.
+- Token scopes (OAuth) and descriptions (API) are shown for context but cannot be modified via this script.
 
 ### General
 - All scripts require Admin-level API access.
