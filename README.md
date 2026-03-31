@@ -21,6 +21,12 @@ A modular collection of Python scripts for automating common Zendesk administrat
 | [Attachment Retention Enforcer](#6-attachment-retention-enforcer) | Redact attachments from old tickets for privacy/storage |
 | [Inactive API Token Auditor](#7-inactive-api-token-auditor) | Find OAuth tokens unused in 30+ days for revocation |
 
+### Ticket Analytics & Reporting
+
+| Script | Purpose |
+|--------|---------|
+| [Ticket Volume Analyzer](#8-ticket-volume-analyzer) | Analyze ticket volume by channel, brand, priority with PDF report + CSV |
+
 ---
 
 ## Architecture
@@ -42,6 +48,10 @@ graph TD
         S3[inactive_api_token_auditor.py]
     end
 
+    subgraph "scripts/ — Analytics & Reporting"
+        R1[ticket_volume_analyzer.py]
+    end
+
     subgraph "zendesk_admin/"
         F["config.py<br/>(load credentials)"]
         G["client.py<br/>(API client)"]
@@ -51,6 +61,7 @@ graph TD
 
     A & B & C & D --> F & G & H & I
     S1 & S2 & S3 --> F & G & H & I
+    R1 --> F & G & H & I
 
     G -->|"HTTP requests<br/>with auth"| J[Zendesk REST API v2]
     G -->|"handles"| K["Rate Limiting<br/>(429 + Retry-After)"]
@@ -646,6 +657,113 @@ Admin Center > Apps and Integrations > APIs
 
 ---
 
+## Ticket Analytics & Reporting Scripts
+
+### 8. Ticket Volume Analyzer
+
+Pulls ticket data from the Zendesk Search API for a configurable date range, breaks it down by **channel**, **brand**, **priority**, and **time period**, then generates a multi-page **PDF report** with charts and summary tables alongside a **CSV export** of all ticket data.
+
+The PDF report includes:
+- Executive summary with key metrics
+- Summary tables (channel, brand, priority, status breakdowns)
+- Volume over time trend chart
+- Channel and brand analysis (pie charts + stacked bar over time)
+- Priority analysis with color-coded charts
+- Hourly heatmap (day-of-week x hour-of-day)
+
+```mermaid
+flowchart TD
+    A[Start] --> B[Parse date range<br/>and period args]
+    B --> C[Fetch all Brands<br/>/api/v2/brands]
+    C --> D["Fetch tickets via<br/>Search API with<br/>date range filter"]
+    D --> E{Results >= 1000?}
+    E -->|Yes, range > 1 day| F[Bisect date range<br/>and recurse both halves]
+    F --> D
+    E -->|No / single day| G[Deduplicate<br/>by ticket ID]
+    G --> H[Extract: channel,<br/>brand, priority, status]
+    H --> I[Aggregate by:<br/>field, time+field,<br/>hourly heatmap]
+    I --> J[Generate charts<br/>matplotlib, Agg backend]
+    J --> K["Build PDF report<br/>(reportlab + chart PNGs)"]
+    K --> L[Write CSV export]
+    L --> M[Print console summary]
+```
+
+#### Usage
+
+```bash
+# Analyze tickets from Q1 2026 with weekly bucketing (default)
+python -m scripts.ticket_volume_analyzer --start-date 2026-01-01 --end-date 2026-03-31
+
+# Monthly period with custom output directory
+python -m scripts.ticket_volume_analyzer \
+  --start-date 2026-01-01 \
+  --end-date 2026-03-31 \
+  --period monthly \
+  --output-dir ./reports
+
+# Daily breakdown for March
+python -m scripts.ticket_volume_analyzer \
+  --start-date 2026-03-01 \
+  --end-date 2026-04-01 \
+  --period daily
+
+# With debug logging
+python -m scripts.ticket_volume_analyzer --start-date 2026-01-01 -v
+```
+
+#### Options
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--start-date` | *(required)* | Start date inclusive (YYYY-MM-DD) |
+| `--end-date` | today | End date exclusive (YYYY-MM-DD) |
+| `--period` | `weekly` | Time bucketing: `daily`, `weekly`, or `monthly` |
+| `--output-dir` | `.` | Directory for output files (created if needed) |
+| `--verbose`, `-v` | off | Enable debug logging |
+| `--env-file` | `.env` | Path to credentials file |
+
+#### Output Files
+
+| File | Format | Description |
+|------|--------|-------------|
+| `ticket_volume_report_YYYYMMDD.pdf` | PDF | Multi-page report with charts and summary tables |
+| `ticket_volume_data_YYYYMMDD.csv` | CSV | Raw ticket data with columns: ticket_id, created_at, subject, channel, brand_name, priority, status, via_source |
+
+#### PDF Report Pages
+
+| Page | Content |
+|------|---------|
+| 1 | Executive summary: date range, key metrics, top channel/brand |
+| 2 | Summary tables: channel, brand, priority, and status breakdowns with counts and percentages |
+| 3 | Volume over time line chart |
+| 4 | Channel analysis: pie chart + stacked bar chart over time |
+| 5 | Brand analysis: pie chart + stacked bar chart over time |
+| 6 | Priority analysis: bar chart + color-coded stacked bar over time |
+| 7 | Hourly heatmap: ticket creation by day-of-week x hour-of-day (UTC) |
+
+#### Sample Output
+
+```
+Fetching brands...
+  Found 3 brand(s).
+Searching tickets from 2026-01-01 to 2026-03-31...
+  Found 8,247 ticket(s).
+Generating charts and PDF report...
+  PDF report: ./reports/ticket_volume_report_20260331.pdf
+Wrote 8,247 rows to ./reports/ticket_volume_data_20260331.csv
+
+--- Summary ---
+  Date range:     2026-01-01 to 2026-03-31
+  Period:         weekly
+  Total tickets:  8,247
+  Channels:       4
+  Brands:         3
+  Top channel:    Email (5,832 tickets)
+  Top brand:      OREI (4,129 tickets)
+```
+
+---
+
 ## Adding a New Script
 
 The project is designed for easy extension. To add a new script:
@@ -768,6 +886,15 @@ For large Zendesk instances, consider running scripts during off-peak hours.
 - This script is **read-only** — it does not revoke tokens. Revocation must be done manually in Admin Center.
 - Token scopes (OAuth) and descriptions (API) are shown for context but cannot be modified via this script.
 
+### Ticket Volume Analyzer
+- The Zendesk Search API returns a **maximum of 1,000 results per query**. The script handles this by automatically bisecting the date range and re-querying, but if a single day exceeds 1,000 tickets, some data may be missing (a warning is logged).
+- All timestamps are in **UTC**. The hourly heatmap reflects UTC hours, not local time.
+- The Search API may have a slight delay in indexing recent tickets (typically a few minutes).
+- Requires `matplotlib` and `reportlab` as additional dependencies.
+- Chart rendering uses the `Agg` (non-interactive) matplotlib backend for headless server compatibility.
+- Pie charts group slices below 3% into "Other" for readability. Stacked bar charts show the top 8 categories.
+- The PDF is generated in landscape letter format. Very large datasets (50+ time buckets) may have crowded x-axis labels.
+
 ### General
 - All scripts require Admin-level API access.
 - API token authentication only (OAuth not supported).
@@ -799,7 +926,8 @@ Zendesk-Admin-Management-Scripts/
     ├── tag_cleanup_bot.py                # Admin & Management
     ├── suspended_ticket_spam_killer.py   # Security & Compliance
     ├── attachment_retention_enforcer.py  # Security & Compliance
-    └── inactive_api_token_auditor.py     # Security & Compliance
+    ├── inactive_api_token_auditor.py     # Security & Compliance
+    └── ticket_volume_analyzer.py         # Ticket Analytics & Reporting
 ```
 
 ---
