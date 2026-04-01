@@ -4,12 +4,28 @@ A modular collection of Python scripts for automating common Zendesk administrat
 
 ## Scripts
 
+### Admin & Management
+
 | Script | Purpose |
 |--------|---------|
 | [Zombie Trigger Auditor](#1-zombie-trigger-auditor) | Find triggers/automations with zero usage |
 | [Bulk Macro Search & Replace](#2-bulk-macro-content-search--replace) | Search and replace text across all macros |
 | [User Permission Snapshotter](#3-user-permission-snapshotter) | Export admin/agent users to CSV for audits |
 | [Tag Cleanup Bot](#4-tag-cleanup-bot) | Identify orphan tags for consolidation |
+
+### Security & Compliance
+
+| Script | Purpose |
+|--------|---------|
+| [Suspended Ticket Spam-Killer](#5-suspended-ticket-spam-killer) | Bulk-delete suspended tickets by cause pattern |
+| [Attachment Retention Enforcer](#6-attachment-retention-enforcer) | Redact attachments from old tickets for privacy/storage |
+| [Inactive API Token Auditor](#7-inactive-api-token-auditor) | Find OAuth tokens unused in 30+ days for revocation |
+
+### Ticket Analytics & Reporting
+
+| Script | Purpose |
+|--------|---------|
+| [Ticket Volume Analyzer](#8-ticket-volume-analyzer) | Analyze ticket volume by channel, brand, priority with PDF report + CSV |
 
 ---
 
@@ -19,12 +35,21 @@ All scripts share a common library (`zendesk_admin/`) that handles authenticatio
 
 ```mermaid
 graph TD
-    subgraph "scripts/"
+    subgraph "scripts/ — Admin & Management"
         A[zombie_trigger_auditor.py]
         B[bulk_macro_search_replace.py]
         C[user_permission_snapshotter.py]
         D[tag_cleanup_bot.py]
-        E[your_new_script.py]
+    end
+
+    subgraph "scripts/ — Security & Compliance"
+        S1[suspended_ticket_spam_killer.py]
+        S2[attachment_retention_enforcer.py]
+        S3[inactive_api_token_auditor.py]
+    end
+
+    subgraph "scripts/ — Analytics & Reporting"
+        R1[ticket_volume_analyzer.py]
     end
 
     subgraph "zendesk_admin/"
@@ -34,7 +59,9 @@ graph TD
         I["utils.py<br/>(CSV & JSON output)"]
     end
 
-    A & B & C & D & E --> F & G & H & I
+    A & B & C & D --> F & G & H & I
+    S1 & S2 & S3 --> F & G & H & I
+    R1 --> F & G & H & I
 
     G -->|"HTTP requests<br/>with auth"| J[Zendesk REST API v2]
     G -->|"handles"| K["Rate Limiting<br/>(429 + Retry-After)"]
@@ -349,6 +376,394 @@ temp_migration_batch2                              201
 
 ---
 
+## Security & Compliance Scripts
+
+### 5. Suspended Ticket Spam-Killer
+
+Bulk-deletes suspended tickets based on specific **cause patterns** (e.g., "Detected as spam", "Automated response mail") to keep the suspended queue manageable. Operates in **report-only mode** by default — requires `--delete` flag to actually remove tickets.
+
+```mermaid
+flowchart TD
+    A[Start] --> B[Load Configuration]
+    B --> C[Fetch all<br/>Suspended Tickets]
+    C --> D{Filter by<br/>cause pattern?}
+    D -->|Yes| E[Match cause<br/>substring, case-insensitive]
+    D -->|No| F[Include all]
+    E --> G{Filter by<br/>age?}
+    F --> G
+    G -->|--older-than N| H[Exclude tickets<br/>newer than N days]
+    G -->|No age filter| I[Include all ages]
+    H --> J[Group by cause<br/>for summary]
+    I --> J
+    J --> K{--delete flag?}
+    K -->|No| L[Report-only mode<br/>show matches]
+    K -->|Yes| M{--dry-run?}
+    M -->|Yes| L
+    M -->|No| N[Bulk delete in<br/>batches of 100]
+    N --> O[Report deleted count]
+```
+
+#### Usage
+
+```bash
+# List all suspended tickets (report only)
+python -m scripts.suspended_ticket_spam_killer
+
+# List suspended tickets matching specific causes
+python -m scripts.suspended_ticket_spam_killer --causes "Detected as spam"
+
+# Multiple cause patterns + age filter
+python -m scripts.suspended_ticket_spam_killer \
+  --causes "Detected as spam" "Automated response mail" \
+  --older-than 30
+
+# Preview deletions (dry run)
+python -m scripts.suspended_ticket_spam_killer \
+  --causes "Detected as spam" --delete --dry-run
+
+# Actually delete matched tickets
+python -m scripts.suspended_ticket_spam_killer \
+  --causes "Detected as spam" --older-than 60 --delete
+
+# Save report to file
+python -m scripts.suspended_ticket_spam_killer --causes "Detected as spam" -o spam_report.json
+```
+
+#### Options
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--causes`, `-c` | *(all)* | Cause patterns to match (case-insensitive substring) |
+| `--older-than` | *(none)* | Only target tickets older than N days |
+| `--delete` | off | Actually delete matched tickets |
+| `--dry-run` | off | Preview deletions (same as omitting `--delete`) |
+| `--output`, `-o` | stdout | Save match report to JSON file |
+| `--verbose`, `-v` | off | Enable debug logging |
+| `--env-file` | `.env` | Path to credentials file |
+
+#### Sample Output
+
+```
+Scanning suspended tickets (causes matching: 'Detected as spam', older than 30 days)...
+
+Found 47 matching suspended ticket(s):
+  - Detected as spam: 42
+  - Detected as spam by Zendesk: 5
+
+ID                   Created                Cause                          Subject
+----------------------------------------------------------------------------------------------------
+8234567890123        2026-01-15             Detected as spam               Win a free iPhone!!!
+8234567890456        2026-01-20             Detected as spam               Urgent business proposal
+  ... and 45 more
+
+[REPORT-ONLY MODE] No tickets deleted.
+Use --delete to permanently remove these tickets.
+```
+
+---
+
+### 6. Attachment Retention Enforcer
+
+Identifies tickets older than a configurable number of years and **redacts attachments** while preserving conversation text. Zendesk replaces redacted attachments with an empty `redacted.txt` file. Helps manage storage costs and comply with data retention/privacy policies (e.g., GDPR).
+
+**WARNING: Redaction is PERMANENT and cannot be undone.**
+
+```mermaid
+flowchart TD
+    A[Start] --> B[Load Configuration]
+    B --> C["Search tickets created<br/>before cutoff date<br/>(Search API)"]
+    C --> D[Limit to --max-tickets<br/>for safety]
+    D --> E[For each ticket:<br/>fetch comments +<br/>attachments]
+    E --> F{Attachments<br/>found?}
+    F -->|No| G[Skip ticket]
+    F -->|Yes| H[Record attachment<br/>details + size]
+    G --> I[Summary report:<br/>tickets, attachments, size]
+    H --> I
+    I --> J{--redact flag?}
+    J -->|No| K[Report-only mode]
+    J -->|Yes| L{--dry-run?}
+    L -->|Yes| K
+    L -->|No| M["PUT .../redact<br/>for each attachment"]
+    M --> N["Attachment replaced<br/>with redacted.txt"]
+    N --> O[Report redacted count<br/>+ storage freed]
+```
+
+#### Usage
+
+```bash
+# Report attachments on tickets older than 2 years (report only)
+python -m scripts.attachment_retention_enforcer --older-than-years 2
+
+# Filter to closed tickets only
+python -m scripts.attachment_retention_enforcer --older-than-years 2 --status closed
+
+# Preview redaction (dry run)
+python -m scripts.attachment_retention_enforcer --older-than-years 3 --redact --dry-run
+
+# Actually redact attachments (PERMANENT)
+python -m scripts.attachment_retention_enforcer --older-than-years 3 --status closed --redact
+
+# Process more tickets (default limit: 100)
+python -m scripts.attachment_retention_enforcer --older-than-years 2 --max-tickets 500
+
+# Save attachment report to file
+python -m scripts.attachment_retention_enforcer --older-than-years 2 -o attachments.json
+```
+
+#### Options
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--older-than-years` | *(required)* | Target tickets created more than N years ago |
+| `--status` | *(all)* | Filter by ticket status: new/open/pending/hold/solved/closed |
+| `--redact` | off | Actually redact attachments (permanent!) |
+| `--dry-run` | off | Preview redactions (same as omitting `--redact`) |
+| `--max-tickets` | `100` | Max tickets to process per run (safety limit) |
+| `--output`, `-o` | stdout | Save attachment report to JSON file |
+| `--verbose`, `-v` | off | Enable debug logging |
+| `--env-file` | `.env` | Path to credentials file |
+
+#### Sample Output
+
+```
+Searching for tickets created before 2024-03-31 with status 'closed'...
+Found 234 ticket(s) matching criteria.
+Limiting to first 100 tickets (use --max-tickets to adjust).
+
+Scanning 100 ticket(s) for attachments...
+  Scanned 20/100 tickets (45 attachments found)
+  Scanned 40/100 tickets (89 attachments found)
+  Scanned 100/100 tickets (156 attachments found)
+
+Results:
+  Tickets scanned:           100
+  Tickets with attachments:  67
+  Total attachments found:   156
+  Total attachment size:     487.3 MB
+
+Ticket       Attachment          Size  File Name
+---------------------------------------------------------------------------
+12345        99001            2.3 MB  invoice_scan.pdf
+12345        99002          512.0 KB  receipt.jpg
+12890        99155           15.7 MB  debug_log.zip
+  ... and 153 more (see full report with -o)
+
+[REPORT-ONLY MODE] No attachments redacted.
+Use --redact to permanently redact these attachments.
+```
+
+---
+
+### 7. Inactive API Token Auditor
+
+Lists all **OAuth access tokens** and **API tokens**, then highlights those that haven't been used within a configurable number of days, alerting the admin to revoke them for security. Cross-references token owners with user details for context.
+
+The script audits two token types:
+- **OAuth tokens** via `/api/v2/oauth/tokens` (tracks last use via `used_at` field)
+- **API tokens** via `/api/v2/api_tokens` (tracks last use via `last_used_at` field)
+
+If the API tokens endpoint is not available on your Zendesk plan (returns 403/404), the script falls back gracefully and reports only OAuth tokens.
+
+```mermaid
+flowchart TD
+    A[Start] --> B[Load Configuration]
+    B --> C{--token-type?}
+    C -->|all or oauth| D[Fetch OAuth tokens<br/>/api/v2/oauth/tokens]
+    C -->|all or api| E[Fetch API tokens<br/>/api/v2/api_tokens]
+    C -->|all| D & E
+    E --> F{Endpoint<br/>available?}
+    F -->|200 OK| G[Parse API tokens]
+    F -->|403/404| H[Log warning<br/>continue without]
+    D --> I[Collect user IDs<br/>from all tokens]
+    G --> I
+    H --> I
+    I --> J[Batch-fetch user<br/>details via show_many]
+    J --> K[Classify each token]
+    K --> L{Last used field<br/>present?}
+    L -->|null| M["Status: never_used"]
+    L -->|has date| N{"Older than<br/>--inactive-days?"}
+    N -->|Yes| O["Status: inactive"]
+    N -->|No| P["Status: active"]
+    M & O & P --> Q[Sort: never_used first<br/>then inactive by days]
+    Q --> R[Summary by type:<br/>OAuth + API counts]
+    R --> S[Output report<br/>JSON or CSV]
+```
+
+#### Usage
+
+```bash
+# Audit all token types with default 30-day inactivity threshold
+python -m scripts.inactive_api_token_auditor
+
+# Custom inactivity threshold (90 days)
+python -m scripts.inactive_api_token_auditor --inactive-days 90
+
+# Audit only OAuth tokens
+python -m scripts.inactive_api_token_auditor --token-type oauth
+
+# Audit only API tokens
+python -m scripts.inactive_api_token_auditor --token-type api
+
+# Export as CSV
+python -m scripts.inactive_api_token_auditor --format csv -o token_audit.csv
+
+# Export as JSON
+python -m scripts.inactive_api_token_auditor -o token_audit.json
+```
+
+#### Options
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--inactive-days` | `30` | Mark tokens inactive if unused for N days |
+| `--token-type` | `all` | Token type to audit: `all`, `oauth`, or `api` |
+| `--format` | `json` | Output format: `json` or `csv` |
+| `--output`, `-o` | stdout | Save report to file |
+| `--verbose`, `-v` | off | Enable debug logging |
+| `--env-file` | `.env` | Path to credentials file |
+
+#### Sample Output
+
+```
+Fetching OAuth tokens...
+  Found 12 OAuth token(s).
+Fetching API tokens...
+  Found 5 API token(s).
+Fetching details for 10 token owner(s)...
+
+Token Audit Summary (inactive threshold: 30 days):
+  Total tokens:    17
+    OAuth tokens:  12
+    API tokens:    5
+  Active:          9
+  Inactive:        5
+  Never used:      3
+
+Tokens requiring attention (8):
+Type        ID           Status        Last Used      Days   User                      Description/Scopes
+--------------------------------------------------------------------------------------------------------------
+API         78901        never_used    never          N/A    staging-bot@company.com   Staging integration
+API         78905        never_used    never          N/A    test@company.com          Test token
+OAuth       44012        never_used    never          N/A    dev-bot@company.com       read, write
+OAuth       44005        inactive      2026-01-15     75     old-integration@co.com    read, write
+API         78903        inactive      2026-02-10     49     data-sync@company.com     Data sync service
+OAuth       44009        inactive      2026-02-01     58     api-user@company.com      read
+OAuth       44011        inactive      2026-02-20     39     reports@company.com       read
+API         78904        inactive      2026-02-25     34     export@company.com        CSV export tool
+
+Recommendation: Review and revoke inactive/unused tokens in
+Admin Center > Apps and Integrations > APIs
+```
+
+---
+
+## Ticket Analytics & Reporting Scripts
+
+### 8. Ticket Volume Analyzer
+
+Pulls ticket data from the Zendesk Search API for a configurable date range, breaks it down by **channel**, **brand**, **priority**, and **time period**, then generates a multi-page **PDF report** with charts and summary tables alongside a **CSV export** of all ticket data.
+
+The PDF report includes:
+- Executive summary with key metrics
+- Summary tables (channel, brand, priority, status breakdowns)
+- Volume over time trend chart
+- Channel and brand analysis (pie charts + stacked bar over time)
+- Priority analysis with color-coded charts
+- Hourly heatmap (day-of-week x hour-of-day)
+
+```mermaid
+flowchart TD
+    A[Start] --> B[Parse date range<br/>and period args]
+    B --> C[Fetch all Brands<br/>/api/v2/brands]
+    C --> D["Fetch tickets via<br/>Search API with<br/>date range filter"]
+    D --> E{Results >= 1000?}
+    E -->|Yes, range > 1 day| F[Bisect date range<br/>and recurse both halves]
+    F --> D
+    E -->|No / single day| G[Deduplicate<br/>by ticket ID]
+    G --> H[Extract: channel,<br/>brand, priority, status]
+    H --> I[Aggregate by:<br/>field, time+field,<br/>hourly heatmap]
+    I --> J[Generate charts<br/>matplotlib, Agg backend]
+    J --> K["Build PDF report<br/>(reportlab + chart PNGs)"]
+    K --> L[Write CSV export]
+    L --> M[Print console summary]
+```
+
+#### Usage
+
+```bash
+# Analyze tickets from Q1 2026 with weekly bucketing (default)
+python -m scripts.ticket_volume_analyzer --start-date 2026-01-01 --end-date 2026-03-31
+
+# Monthly period with custom output directory
+python -m scripts.ticket_volume_analyzer \
+  --start-date 2026-01-01 \
+  --end-date 2026-03-31 \
+  --period monthly \
+  --output-dir ./reports
+
+# Daily breakdown for March
+python -m scripts.ticket_volume_analyzer \
+  --start-date 2026-03-01 \
+  --end-date 2026-04-01 \
+  --period daily
+
+# With debug logging
+python -m scripts.ticket_volume_analyzer --start-date 2026-01-01 -v
+```
+
+#### Options
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--start-date` | *(required)* | Start date inclusive (YYYY-MM-DD) |
+| `--end-date` | today | End date exclusive (YYYY-MM-DD) |
+| `--period` | `weekly` | Time bucketing: `daily`, `weekly`, or `monthly` |
+| `--output-dir` | `.` | Directory for output files (created if needed) |
+| `--verbose`, `-v` | off | Enable debug logging |
+| `--env-file` | `.env` | Path to credentials file |
+
+#### Output Files
+
+| File | Format | Description |
+|------|--------|-------------|
+| `ticket_volume_report_YYYYMMDD.pdf` | PDF | Multi-page report with charts and summary tables |
+| `ticket_volume_data_YYYYMMDD.csv` | CSV | Raw ticket data with columns: ticket_id, created_at, subject, channel, brand_name, priority, status, via_source |
+
+#### PDF Report Pages
+
+| Page | Content |
+|------|---------|
+| 1 | Executive summary: date range, key metrics, top channel/brand |
+| 2 | Summary tables: channel, brand, priority, and status breakdowns with counts and percentages |
+| 3 | Volume over time line chart |
+| 4 | Channel analysis: pie chart + stacked bar chart over time |
+| 5 | Brand analysis: pie chart + stacked bar chart over time |
+| 6 | Priority analysis: bar chart + color-coded stacked bar over time |
+| 7 | Hourly heatmap: ticket creation by day-of-week x hour-of-day (UTC) |
+
+#### Sample Output
+
+```
+Fetching brands...
+  Found 3 brand(s).
+Searching tickets from 2026-01-01 to 2026-03-31...
+  Found 8,247 ticket(s).
+Generating charts and PDF report...
+  PDF report: ./reports/ticket_volume_report_20260331.pdf
+Wrote 8,247 rows to ./reports/ticket_volume_data_20260331.csv
+
+--- Summary ---
+  Date range:     2026-01-01 to 2026-03-31
+  Period:         weekly
+  Total tickets:  8,247
+  Channels:       4
+  Brands:         3
+  Top channel:    Email (5,832 tickets)
+  Top brand:      OREI (4,129 tickets)
+```
+
+---
+
 ## Adding a New Script
 
 The project is designed for easy extension. To add a new script:
@@ -403,6 +818,7 @@ The shared `ZendeskClient` handles authentication, pagination, and rate limiting
 |--------|-------------|
 | `client.get(endpoint, params)` | GET request, returns JSON dict |
 | `client.put(endpoint, json)` | PUT request, returns JSON dict |
+| `client.delete(endpoint, params)` | DELETE request, returns JSON dict or None (204) |
 | `client.paginate(endpoint, key, params)` | Yields individual records from paginated endpoint |
 
 ---
@@ -450,6 +866,35 @@ For large Zendesk instances, consider running scripts during off-peak hours.
 - Tags referenced only in **Macros** or **SLA policies** are not checked (only Triggers, Automations, and Views are scanned).
 - Tag names are compared as exact strings (case-sensitive).
 
+### Suspended Ticket Spam-Killer
+- Bulk delete is limited to **100 ticket IDs per API request** (handled automatically in batches).
+- Deletion is **permanent** — suspended tickets cannot be recovered after deletion.
+- The `cause` field is matched as a case-insensitive substring. Partial matches may capture unintended tickets — always review in report-only mode first.
+- Only Admins or custom-role agents with suspended ticket permissions can access this endpoint.
+
+### Attachment Retention Enforcer
+- Redaction is **permanent and cannot be undone**. Zendesk replaces the attachment with an empty `redacted.txt` file.
+- Cannot redact attachments on **closed tickets** on some Zendesk plans. The script logs warnings for failed redactions.
+- Uses the Zendesk Search API, which has its own rate limits and may return incomplete results for very large instances.
+- The `--max-tickets` safety limit defaults to 100 per run to prevent accidental mass redaction.
+- File size reported is from Zendesk metadata — actual storage savings may vary.
+
+### Inactive API Token Auditor
+- Audits both **OAuth tokens** (`/api/v2/oauth/tokens`) and **API tokens** (`/api/v2/api_tokens`).
+- The `/api/v2/api_tokens` endpoint **may not be available on all Zendesk plans**. If it returns 403 or 404, the script falls back gracefully and reports only OAuth tokens.
+- OAuth tokens use the `used_at` field; API tokens use the `last_used_at` field. A `null` value means the token was never used.
+- This script is **read-only** — it does not revoke tokens. Revocation must be done manually in Admin Center.
+- Token scopes (OAuth) and descriptions (API) are shown for context but cannot be modified via this script.
+
+### Ticket Volume Analyzer
+- The Zendesk Search API returns a **maximum of 1,000 results per query**. The script handles this by automatically bisecting the date range and re-querying, but if a single day exceeds 1,000 tickets, some data may be missing (a warning is logged).
+- All timestamps are in **UTC**. The hourly heatmap reflects UTC hours, not local time.
+- The Search API may have a slight delay in indexing recent tickets (typically a few minutes).
+- Requires `matplotlib` and `reportlab` as additional dependencies.
+- Chart rendering uses the `Agg` (non-interactive) matplotlib backend for headless server compatibility.
+- Pie charts group slices below 3% into "Other" for readability. Stacked bar charts show the top 8 categories.
+- The PDF is generated in landscape letter format. Very large datasets (50+ time buckets) may have crowded x-axis labels.
+
 ### General
 - All scripts require Admin-level API access.
 - API token authentication only (OAuth not supported).
@@ -475,10 +920,14 @@ Zendesk-Admin-Management-Scripts/
 │   └── utils.py            # CSV and JSON output helpers
 └── scripts/                # Runnable admin scripts
     ├── __init__.py
-    ├── zombie_trigger_auditor.py
-    ├── bulk_macro_search_replace.py
-    ├── user_permission_snapshotter.py
-    └── tag_cleanup_bot.py
+    ├── zombie_trigger_auditor.py         # Admin & Management
+    ├── bulk_macro_search_replace.py      # Admin & Management
+    ├── user_permission_snapshotter.py    # Admin & Management
+    ├── tag_cleanup_bot.py                # Admin & Management
+    ├── suspended_ticket_spam_killer.py   # Security & Compliance
+    ├── attachment_retention_enforcer.py  # Security & Compliance
+    ├── inactive_api_token_auditor.py     # Security & Compliance
+    └── ticket_volume_analyzer.py         # Ticket Analytics & Reporting
 ```
 
 ---

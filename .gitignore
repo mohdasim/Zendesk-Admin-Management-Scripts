@@ -23,6 +23,7 @@ env/
 # Output files
 output/
 *.csv
+*.pdf
 !.env.example
 
 # OS
